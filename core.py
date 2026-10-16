@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import socket
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from . import crypto, notices
@@ -40,6 +42,8 @@ _TOKEN = re.compile(r"^[0-9a-fA-F]{32,400}$")
 _TOPIC = re.compile(r"^[A-Za-z0-9.-]{3,200}$")
 _DEVICE = re.compile(r"^[A-Za-z0-9._:-]{4,80}$")
 ACTIVITY_MIN_INTERVAL = 12.0   # seconds between "working" Live Activity updates
+CARD_POLL_SECONDS = 5.0        # how often the gateway looks for cards ready for review or stopped
+TIDY_POLL_SECONDS = 30.0       # how often it looks for a finished tidy (the curator's run reports)
 ROOM_MESSAGE_SETTLE = 5.0      # a Bot's streamed message counts as finished after this quiet time
 # Surfaces whose replies the app reports. A messaging platform's own app already notifies, and cron
 # results come through the delivery platform.
@@ -221,6 +225,14 @@ class Push:
         if kind == "task" and prefs["tasks"] != "all":
             return False
         if kind == "task_failed" and prefs["tasks"] == "off":
+            return False
+        # Board cards follow the same switch: a card that needs you or stopped is a "failure".
+        if kind in ("card_review", "card_done") and prefs["tasks"] != "all":
+            return False
+        if kind in ("card_needs_you", "card_stopped") and prefs["tasks"] == "off":
+            return False
+        # A tidy is routine news, like a task that finished.
+        if kind == "tidied" and prefs["tasks"] != "all":
             return False
         if kind == "message" and (prefs["bots"] == "off" or (prefs["bots"] == "mentions"
                                                             and not notice.extra.get("mention"))):
@@ -490,17 +502,134 @@ class Push:
         self.deliver(notices.message(room_id=room_id, room=room_name, member_id=member_id, bot=bot,
                                      gateway_name=self.gateway_name(), text=buffer["text"], mention=mention))
 
+    # -- the Board (docs/board.md §5) -------------------------------------------------------------------
+    # Hermes fires hooks for a blocked card and a finished one; "ready for review" and "stopped" have
+    # none, so the gateway's process watches the boards' events for those (``watch_cards``).
+
     def on_kanban_task_completed(self, task_id: str = "", board: str = "", assignee: str = "",
                                  summary: str = "", **_: Any) -> None:
-        self.deliver(notices.kanban(task_id=task_id, board=board, title=_kanban_title(task_id, board),
-                                    assignee=assignee or "", gateway_name=self.gateway_name(), text=summary or "",
-                                    blocked=False))
+        self.card_notice("card_done", task_id, board, assignee, summary)
 
     def on_kanban_task_blocked(self, task_id: str = "", board: str = "", assignee: str = "", reason: str = "",
                                **_: Any) -> None:
-        self.deliver(notices.kanban(task_id=task_id, board=board, title=_kanban_title(task_id, board),
-                                    assignee=assignee or "", gateway_name=self.gateway_name(), text=reason or "",
-                                    blocked=True))
+        # Only a card that waits on a person: a dependency wait (back in To Do) or a flaky failure
+        # that may clear says nothing.
+        card = _kanban_card(task_id, board)
+        if card is not None and (card.get("status") != "blocked" or card.get("block_kind") in ("dependency", "transient")):
+            return
+        self.card_notice("card_needs_you", task_id, board, assignee, reason, card=card)
+
+    def card_notice(self, kind: str, task_id: str, board: str, assignee: str, text: str,
+                    card: dict | None = None) -> None:
+        if not task_id:
+            return
+        card = card if card is not None else (_kanban_card(task_id, board) or {})
+        profile = assignee or card.get("assignee") or ""
+        self.deliver(notices.card(kind, card_id=task_id, board=board or card.get("board") or "", title=card.get("title", ""),
+                                  who=_profile_title(profile), profile=profile, project_id=card.get("project_id", ""),
+                                  gateway_name=self.gateway_name(), text=text or ""))
+
+    def watch_cards(self) -> None:
+        """Starts the board watcher once (the gateway process; worker processes don't)."""
+        with self._lock:
+            if getattr(self, "_card_watch", None) is not None:
+                return
+            self._card_watch = threading.Thread(target=self._watch_cards, name="app-push-cards", daemon=True)
+            self._card_watch.start()
+
+    def _watch_cards(self) -> None:
+        tidies_at = 0.0
+        while True:
+            time.sleep(CARD_POLL_SECONDS)
+            try:
+                if self.store.devices():
+                    self.poll_cards()
+            except Exception:
+                logger.debug("app push: card watch failed", exc_info=True)
+            if time.monotonic() - tidies_at >= TIDY_POLL_SECONDS:
+                tidies_at = time.monotonic()
+                try:
+                    if self.store.devices():
+                        self.poll_tidies()
+                except Exception:
+                    logger.debug("app push: tidy watch failed", exc_info=True)
+
+    def poll_cards(self) -> int:
+        """Review requests and stops since the last look, once each: the cursor per board moves under
+        the store's lock, so two processes never send the same one."""
+        from hermes_cli import kanban_db
+        from hermes_cli.kanban_db_connect import connect_closing
+        sent = 0
+        for meta in kanban_db.list_boards():
+            slug = meta.get("slug") or "default"
+            with connect_closing(board=slug) as conn:
+                latest = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0])
+
+                def advance(state: dict, slug: str = slug, latest: int = latest):
+                    cursors = state.setdefault("card_cursors", {})
+                    start = cursors.get(slug)
+                    cursors[slug] = max(latest, start or 0)
+                    return start
+
+                start = self.store.update(advance)
+                if start is None or start >= latest:
+                    continue  # first sight of the board: start from now, never the backlog
+                rows = conn.execute(
+                    "SELECT task_id, kind, payload FROM task_events WHERE id > ? AND id <= ? "
+                    "AND kind IN ('review_requested', 'gave_up', 'crashed') ORDER BY id", (start, latest)).fetchall()
+            for task_id, kind, payload in rows:
+                try:
+                    data = json.loads(payload) if payload else {}
+                except ValueError:
+                    data = {}
+                card = _kanban_card(task_id, slug)
+                if card is None:
+                    continue
+                if kind == "review_requested":
+                    self.card_notice("card_review", task_id, slug, card.get("assignee") or "", card.get("summary") or "", card=card)
+                else:
+                    self.card_notice("card_stopped", task_id, slug, card.get("assignee") or "",
+                                     str(data.get("error") or card.get("error") or ""), card=card)
+                sent += 1
+        return sent
+
+    # -- What Hermes Learned (docs/learned.md) ---------------------------------------------------------------
+    # The curator fires no hook when it tidies: the same watcher looks for new run reports
+    # (``logs/curator/<run>/run.json``) in each profile's home and sends one quiet notice for the newest
+    # tidy that changed something.
+
+    def poll_tidies(self) -> int:
+        sent = 0
+        for profile, home in _profile_homes():
+            root = home / "logs" / "curator"
+            try:
+                runs = sorted(p.name for p in root.iterdir() if (p / "run.json").is_file()) if root.is_dir() else []
+            except OSError:
+                continue
+
+            def advance(state: dict, profile: str = profile, latest: str = runs[-1] if runs else ""):
+                cursors = state.setdefault("tidy_cursors", {})
+                start = cursors.get(profile)
+                cursors[profile] = max(latest, start or "")
+                return start
+
+            start = self.store.update(advance)
+            if start is None:
+                continue  # first sight of the profile: from now on, never the old reports
+            for run in reversed([r for r in runs if r > start]):
+                try:
+                    report = json.loads((root / run / "run.json").read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                merged, archived, stale = _tidy_counts(report)
+                if not (merged or archived or stale):
+                    continue
+                name = "" if profile == "default" else profile
+                self.deliver(notices.tidied(profile=name, who=_profile_title(name), gateway_name=self.gateway_name(),
+                                            run=run, merged=merged, archived=archived, stale=stale))
+                sent += 1
+                break  # the newest tidy says it; older ones in between would only collapse into it
+        return sent
 
     # -- cron delivery -------------------------------------------------------------------------------------
 
@@ -656,15 +785,60 @@ def _parse_cron(message: str) -> tuple[str, str, str]:
     return "", "", str(message or "")
 
 
-def _kanban_title(task_id: str, board: str) -> str:
+def _kanban_card(task_id: str, board: str) -> dict | None:
+    """The card's facts a notice needs (title, column, why it's blocked, who, project, latest
+    summary); None when it can't be read."""
     with contextlib.suppress(Exception):
         from hermes_cli import kanban_db
         from hermes_cli.kanban_db_connect import connect_closing
         with connect_closing(board=board or None) as conn:
             task = kanban_db.get_task(conn, task_id)
-            if task is not None and task.title:
-                return str(task.title)
-    return ""
+            if task is None:
+                return None
+            project = task.project_id
+            if not project:
+                with contextlib.suppress(Exception):
+                    project = (kanban_db.read_board_metadata(board) or {}).get("project_id") if board else None
+            return {"title": str(task.title or ""), "status": task.status, "block_kind": task.block_kind,
+                    "assignee": task.assignee or "", "project_id": project or "", "board": board or "",
+                    "summary": kanban_db.latest_summary(conn, task_id) or "", "error": task.last_failure_error or ""}
+    return None
+
+
+def _profile_homes() -> list[tuple[str, Path]]:
+    """Every profile's home, the default's first: where each one's curator writes its reports."""
+    with contextlib.suppress(Exception):
+        from hermes_cli.profiles import list_profiles
+        return [(p.name, Path(p.path)) for p in list_profiles(lazy_skill_count=True)]
+    from hermes_constants import get_hermes_home
+    return [("default", get_hermes_home())]
+
+
+def _tidy_counts(report: dict) -> tuple[int, int, int]:
+    """Merged, archived and marked stale, as the app counts them (HermesKit's ``CuratorReport``):
+    merged skills are archived too but count once; unused ones archived before the review are only
+    counted in ``auto_transitions``."""
+    def names(rows) -> set[str]:
+        return {str(r.get("name") if isinstance(r, dict) else r) for r in rows or [] if r}
+
+    auto = report.get("auto_transitions") or {}
+    merged = names(report.get("consolidated"))
+    archived = (names(report.get("pruned")) | names(report.get("archived"))) - merged
+    stale = sum(1 for t in report.get("state_transitions") or [] if isinstance(t, dict) and t.get("to") == "stale")
+    return (len(merged), len(archived) + int(auto.get("archived") or 0), max(stale, int(auto.get("marked_stale") or 0)))
+
+
+def _profile_title(profile: str) -> str:
+    """A profile's name as the app shows it: "Hermes" for the default, else its display name."""
+    if not profile or profile == "default":
+        return "Hermes"
+    with contextlib.suppress(Exception):
+        from hermes_cli.profiles import get_profile_dir, read_profile_meta
+        meta = read_profile_meta(get_profile_dir(profile))
+        name = meta.get("bot_title") or meta.get("display_name")
+        if name:
+            return str(name)
+    return profile.replace("-", " ").replace("_", " ").title()
 
 
 def _room_names(room_id: str, member_id: str) -> tuple[str, str]:

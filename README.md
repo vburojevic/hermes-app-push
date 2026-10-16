@@ -39,6 +39,7 @@ Scheduled tasks: `deliver: apppush`, and `failure_deliver: apppush:fail` to hear
 | cron delivery (`apppush`) | task result or failure | `TASK` | passive / active |
 | `kanban_task_completed` / `kanban_task_blocked` | a Kanban card done, or stuck | `TASK` | passive / active |
 | `on_room_member_activity` | a Bot's group message (settled after 5 s) | `MESSAGE` | active |
+| none: the gateway reads each profile's new `logs/curator/<run>/run.json` every 30 s | "Hermes tidied its skills" when a tidy merged, archived or marked something (once per run; follows the tasks setting) | `OPEN` | passive |
 | `post_approval_response`, `on_human_input_resolved` | background "withdraw" push | — | — |
 
 Live Activities: `pre_llm_call`, `pre_tool_call`, approvals and questions, and `on_session_end` update the

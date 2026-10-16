@@ -19,6 +19,8 @@ from typing import Any
 from . import crypto
 
 APPROVAL, QUESTION, REPLY, MESSAGE, TASK, OPEN = "APPROVAL", "QUESTION", "REPLY", "MESSAGE", "TASK", "OPEN"
+CARD, BOARD = "CARD", "BOARD"  # a board card needs you (Reply, Open); a card's other news (Open)
+MEMORY = "MEMORY"  # an approval titled "Save to memory?": Save, Don't Save (docs/memory.md)
 
 KINDS = {
     # kind: (category, interruption level, relevance, fallback title)
@@ -31,7 +33,15 @@ KINDS = {
     "message": (MESSAGE, "active", 0.6, "New message"),
     "background": (OPEN, "passive", 0.2, "Background work finished"),
     "test": (OPEN, "active", 0.4, "Push notifications are on"),
+    # The Board (docs/board.md §5). Never "task": in the app, tasks are scheduled jobs.
+    "card_needs_you": (CARD, "time-sensitive", 1.0, "A card needs you"),
+    "card_review": (BOARD, "active", 0.6, "A card is ready for review"),
+    "card_stopped": (BOARD, "active", 0.6, "A card stopped"),
+    "card_done": (BOARD, "passive", 0.3, "A card is done"),
+    # What Hermes Learned (docs/learned.md): a tidy that changed something. Opens Tidying.
+    "tidied": (OPEN, "passive", 0.2, "Hermes tidied its skills"),
 }
+CARD_KINDS = ("card_needs_you", "card_review", "card_stopped", "card_done")
 
 MAX_BODY = 400
 MAX_COMMAND = 600
@@ -55,7 +65,7 @@ class Notice:
 
     @property
     def category(self) -> str:
-        return KINDS[self.kind][0]
+        return MEMORY if self.kind == "approval" and self.extra.get("memory") else KINDS[self.kind][0]
 
     def content(self, gateway: dict, open_count: int, resolved: list[str]) -> dict:
         data = {k: v for k, v in asdict(self).items() if v not in ("", None, {}) and k != "extra"}
@@ -117,6 +127,15 @@ def approval(*, request_id: str, session_id: str, chat: str, gateway_name: str, 
              surface: str = "", bot: str = "") -> Notice:
     command = clip(redact(command), MAX_COMMAND)
     description = clip(redact(description), 200)
+    if description.startswith("Save to memory"):
+        # The memory tool asking before it saves: the entry is the one memory text a push carries.
+        return Notice(
+            kind="approval", id=request_id, request_id=request_id, session_id=session_id, thread=session_id,
+            summary=chat, title=f"{bot} wants to remember something" if bot else "Hermes wants to remember something",
+            subtitle=chat, body=clip(command, 240), hidden=f"Wants to remember something on {gateway_name}",
+            expires_at=expires_at,
+            extra={"command": command, "description": description, "choices": [c for c in choices if c != "always"],
+                   "memory": True, "surface": surface, **({"bot": bot} if bot else {})})
     shown = clip(command, 80) or "a command"
     return Notice(
         kind="approval", id=request_id, request_id=request_id, session_id=session_id, thread=session_id,
@@ -170,16 +189,50 @@ def task(*, job_id: str, name: str, gateway_name: str, text: str, failed: bool) 
         extra={"job_id": job_id, "failed": failed})
 
 
-def kanban(*, task_id: str, board: str, title: str, assignee: str, gateway_name: str, text: str,
-           blocked: bool) -> Notice:
-    """A Kanban card finished (or is stuck and needs someone)."""
-    name = clip(redact(title), 80) or "Task"
+def card(kind: str, *, card_id: str, board: str, title: str, who: str, profile: str, project_id: str,
+         gateway_name: str, text: str) -> Notice:
+    """A board card: needs you (with the question), ready for review, stopped, or done. One notice
+    per card at a time (the id collapses them); the thread is the board."""
+    name = clip(redact(title), 80) or "A card"
+    who = who or "Hermes"
+    if kind == "card_needs_you":
+        heading, subtitle, fallback = f"{who} needs you on “{name}”", "", "Open Hermes to answer."
+        hidden = f"A card needs you on {gateway_name}"
+    elif kind == "card_review":
+        heading, subtitle, fallback = "Ready for review", name, "Open Hermes to review it."
+        hidden = f"A card is ready for review on {gateway_name}"
+    elif kind == "card_stopped":
+        heading, subtitle, fallback = "Stopped", name, "It stopped before it was done."
+        hidden = f"A card stopped on {gateway_name}"
+    else:
+        heading, subtitle, fallback = "Done", name, "Done."
+        hidden = f"A card is done on {gateway_name}"
     return Notice(
-        kind="task_failed" if blocked else "task", id=f"kanban-{short_hash(task_id)}", thread=f"kanban:{board or 'default'}",
-        summary=name, title=name, subtitle=("Blocked" if blocked else "Done") + (f" · {assignee}" if assignee else ""),
-        body=first_lines(redact(text), 4, 400) or ("Needs a look." if blocked else "Done."),
-        hidden=(f"A task is blocked on {gateway_name}" if blocked else f"A task finished on {gateway_name}"),
-        extra={"job_id": task_id, "failed": blocked, "kanban": True})
+        kind=kind, id=f"card-{short_hash(card_id)}", thread=f"board:{board or 'default'}", summary=name,
+        title=heading, subtitle=subtitle, body=first_lines(redact(text), 4, 400) or fallback, hidden=hidden,
+        extra={"card_id": card_id, "board": board or "default", "project_id": project_id or "",
+               "card_title": name, **({"bot": who} if who != "Hermes" else {}), "assignee": profile or ""})
+
+
+def tidied(*, profile: str, who: str, gateway_name: str, run: str, merged: int, archived: int,
+           stale: int) -> Notice:
+    """One quiet notice per Bot after its curator tidied: "Merged 2 overlapping skills and archived 3
+    unused ones." The id collapses it with the previous tidy's."""
+    parts = []
+    if merged:
+        parts.append(f"merged {merged} overlapping skill{'' if merged == 1 else 's'}")
+    if archived:
+        parts.append(f"archived {archived} unused one{'' if archived == 1 else 's'}")
+    if stale:
+        parts.append(f"marked {stale} as stale")
+    sentence = ", ".join(parts[:-1]) + " and " + parts[-1] if len(parts) > 1 else "".join(parts)
+    key = profile or "default"
+    return Notice(
+        kind="tidied", id=f"tidy-{short_hash(key)}", thread=f"learned:{key}", title=f"{who} tidied its skills",
+        body=(sentence[:1].upper() + sentence[1:] + ".") if sentence else "Its skills are tidier.",
+        hidden=f"Skills were tidied on {gateway_name}",
+        extra={"run": run, "merged": merged, "archived": archived, "stale": stale,
+               **({"profile": profile, "bot": who} if profile else {})})
 
 
 def message(*, room_id: str, room: str, member_id: str, bot: str, gateway_name: str, text: str,
@@ -195,6 +248,8 @@ def message(*, room_id: str, room: str, member_id: str, bot: str, gateway_name: 
 
 def apns_request(device: dict, notice: Notice, gateway: dict, open_count: int, resolved: list[str]) -> dict:
     category, level, relevance, fallback = KINDS[notice.kind]
+    if notice.category == MEMORY:
+        category, level, fallback = MEMORY, "active", "Hermes wants to remember something"
     aps: dict[str, Any] = {
         "alert": {"title": fallback, "body": "Open Hermes to see it."},
         "mutable-content": 1, "category": category, "interruption-level": level, "relevance-score": relevance,
@@ -207,7 +262,7 @@ def apns_request(device: dict, notice: Notice, gateway: dict, open_count: int, r
         "payload": {"aps": aps, "hermes": crypto.seal(device["public_key"], notice.content(gateway, open_count,
                                                                                             resolved))},
     }
-    if notice.request_id or notice.kind in ("reply", "task", "task_failed"):
+    if notice.request_id or notice.kind in ("reply", "task", "task_failed", "tidied", *CARD_KINDS):
         request["collapse_id"] = (notice.request_id or notice.id)[:64]
     expiry = notice.expires_at or time.time() + 86_400
     request["expiration"] = int(expiry)

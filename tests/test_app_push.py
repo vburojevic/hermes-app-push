@@ -115,6 +115,25 @@ def make_device(handler, name="iphone", **prefs):
     return key, token
 
 
+def relay_allowlists() -> tuple[set[str], set[str]]:
+    """The relay's own kind-only titles and categories (``Relay/convex/validate.ts``): a notice the
+    plugin sends that the relay doesn't list never reaches a phone."""
+    import re
+    source = (PLUGIN_DIR.parents[1] / "Relay" / "convex" / "validate.ts").read_text()
+    titles = re.search(r"ALERT_TITLES = new Set\(\[(.*?)\]\)", source, re.S).group(1)
+    categories = re.search(r"CATEGORIES = new Set\(\[(.*?)\]\)", source, re.S).group(1)
+    return set(re.findall(r'"([^"]+)"', titles)), set(re.findall(r'"([^"]+)"', categories))
+
+
+def test_every_notice_kind_is_one_the_relay_forwards(hermes):
+    module = sys.modules[_core_module().__name__.rsplit(".", 1)[0] + ".notices"]
+    titles, categories = relay_allowlists()
+    for kind, (category, _level, _relevance, fallback) in module.KINDS.items():
+        assert fallback in titles, f"{kind}: the relay refuses {fallback!r}"
+        assert category in categories, f"{kind}: the relay refuses category {category!r}"
+    assert module.MEMORY in categories
+
+
 def wait_for(predicate, timeout=6.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -211,6 +230,32 @@ def test_approval_notifies_with_request_id_and_withdraws_when_answered(hermes):
     body = opened(key, withdraw)
     assert body["kind"] == "withdraw" and content["request_id"] in body["ids"]
     assert withdraw["payload"]["aps"] == {"content-available": 1}
+
+
+def test_a_memory_save_request_has_its_own_category(hermes):
+    """An approval titled "Save to memory?" (Ask Before Saving on): MEMORY, Save / Don't Save, no Always."""
+    _, handler = hermes
+    key, token = make_device(handler, "memory")
+    from tools import approval
+    from tools.approval_gateway_wait import _await_gateway_decision
+    session = "20261016_memory_test"
+    result = {}
+    worker = threading.Thread(target=lambda: result.update(_await_gateway_decision(
+        session, lambda data: None, {"command": "Vegetarian; avoids flights after 21:00.",
+                                     "description": "Save to memory: add to user profile",
+                                     "allow_permanent": False, "pattern_key": "memory", "pattern_keys": ["memory"]})))
+    worker.start()
+    push = wait_for(lambda: next(iter(pushes_for(token, "alert")), None))
+    content = opened(key, push)
+    assert push["payload"]["aps"]["category"] == "MEMORY"
+    assert push["payload"]["aps"]["interruption-level"] == "active"
+    assert content["title"] == "Hermes wants to remember something"
+    assert content["body"] == "Vegetarian; avoids flights after 21:00."
+    assert "always" not in content["choices"] and content["memory"] is True
+    assert content["hidden"] == "Wants to remember something on Test Mac"
+    approval.resolve_gateway_approval(session, "deny", request_id=content["request_id"])
+    worker.join(5)
+    assert result.get("choice") == "deny"
 
 
 def test_approval_timeout_withdraws(hermes):
@@ -333,15 +378,15 @@ def test_relay_never_sees_content():
     blob = "\n".join(FakeRelay.raw)
     assert FakeRelay.raw, "no pushes were sent"
     for needle in (SECRET, "curl", "rm -rf", "apt-get", "Which branch", "Freed 12 GB", "Nightly backup", "disk full",
-                   "Test Mac"):
+                   "Test Mac", "Vegetarian"):
         assert needle not in blob, f"{needle!r} reached the relay"
-    allowed_titles = {"Hermes needs your OK", "Hermes has a question", "Hermes needs a password", "Hermes replied",
-                      "A scheduled task finished", "A scheduled task failed", "New message",
-                      "Background work finished", "Push notifications are on"}
+    allowed_titles, allowed_categories = relay_allowlists()
     for push in FakeRelay.pushes:
-        alert = push["payload"].get("aps", {}).get("alert")
+        aps = push["payload"].get("aps", {})
+        alert = aps.get("alert")
         if alert:
-            assert alert["title"] in allowed_titles
+            assert alert["title"] in allowed_titles, f"the relay refuses the title {alert['title']!r}"
+            assert aps["category"] in allowed_categories, f"the relay refuses the category {aps['category']!r}"
 
 
 
@@ -402,14 +447,21 @@ def test_reply_after_walking_away_and_kanban_jobs(hermes):
                         child_summary="Done.", child_status="completed", duration_ms=600_000)
     time.sleep(0.5)
     assert len(pushes_for(token, "alert")) == before
-    # A Kanban card done (passive) and one blocked (active), on by default.
+    # A board card done (passive) and one that needs you (Time Sensitive, with Reply), on by
+    # default. Cards, never tasks: in the app, tasks are scheduled jobs.
     plugins.invoke_hook("kanban_task_completed", task_id="t_1", board="ops", assignee="ada", summary="Rotated the keys.")
     plugins.invoke_hook("kanban_task_blocked", task_id="t_2", board="ops", assignee="ada", reason="Needs the VPN password.")
     wait_for(lambda: len(pushes_for(token, "alert")) >= before + 2)
-    done, blocked = [opened(key, p) for p in pushes_for(token, "alert")[-2:]]
-    assert done["kind"] == "task" and done["body"] == "Rotated the keys." and done["subtitle"] == "Done · ada"
-    assert blocked["kind"] == "task_failed" and blocked["subtitle"] == "Blocked · ada"
-    assert pushes_for(token, "alert")[-1]["payload"]["aps"]["interruption-level"] == "active"
+    done_push, blocked_push = pushes_for(token, "alert")[-2:]
+    done, blocked = opened(key, done_push), opened(key, blocked_push)
+    assert done["kind"] == "card_done" and done["title"] == "Done" and done["body"] == "Rotated the keys."
+    assert done["card_id"] == "t_1" and done["board"] == "ops" and done["thread"] == "board:ops"
+    assert blocked["kind"] == "card_needs_you" and blocked["title"].startswith("Ada needs you on")
+    assert blocked["body"] == "Needs the VPN password." and blocked["category"] == "CARD"
+    assert done_push["payload"]["aps"]["interruption-level"] == "passive"
+    assert blocked_push["payload"]["aps"]["interruption-level"] == "time-sensitive"
+    for notice in (done, blocked):
+        assert "task" not in (notice["title"] + notice.get("subtitle", "") + notice.get("hidden", "")).lower()
 
 
 def test_held_while_on_screen_then_sent_on_leaving(hermes):
@@ -475,3 +527,86 @@ def test_never_touches_the_real_hermes_home():
     for path in after:
         if path in REAL_BEFORE and after[path] != REAL_BEFORE[path]:
             assert not test_device.search(Path(path).read_text(errors="ignore")), f"a test device reached {path}"
+
+
+def test_cards_ready_for_review_and_stopped_once_each(hermes):
+    """Hermes fires no hook for a review request or a run that gave up: the gateway's watcher reads
+    the boards' events for them, starting from now, and each is sent once, whichever process looks."""
+    import sys
+    _, handler = hermes
+    key, token = make_device(handler, name="board-watch")
+    # The copy Hermes's plugin manager loaded (configured with the relay): the one behind /app-push.
+    push = sys.modules[handler.__module__]._instance()
+    from hermes_cli import kanban_db
+    from hermes_cli.kanban_db_boards import create_board
+    from hermes_cli.kanban_db_connect import connect_closing
+    create_board("cards", name="Cards")
+    with connect_closing(board="cards") as conn:
+        tid = kanban_db.create_task(conn, title="Ship 1.3 to TestFlight", assignee="default", board="cards")
+    push.poll_cards()  # first sight: from now on, no backlog
+    assert push.store.read()["card_cursors"]["cards"] >= 1
+
+    def cards():
+        return [n for n in (opened(key, p) for p in pushes_for(token, "alert")) if n.get("card_id") == tid]
+
+    with connect_closing(board="cards") as conn:
+        assert kanban_db.request_review(conn, tid, summary="Uploaded; notes are in.", force=True)
+    push.poll_cards()
+    review = wait_for(lambda: cards() and cards()[-1])
+    assert review["kind"] == "card_review" and review["title"] == "Ready for review"
+    assert review["subtitle"] == "Ship 1.3 to TestFlight" and review["category"] == "BOARD"
+    with connect_closing(board="cards") as conn:
+        kanban_db._append_event(conn, tid, "gave_up", {"failures": 3, "error": "Build fails: no signing identity."})
+        conn.commit()
+    push.poll_cards()
+    stopped = wait_for(lambda: len(cards()) >= 2 and cards()[-1])
+    assert stopped["kind"] == "card_stopped" and stopped["title"] == "Stopped"
+    assert stopped["body"] == "Build fails: no signing identity."
+    push.poll_cards()
+    time.sleep(CARD_SETTLE)
+    assert [n["kind"] for n in cards()] == ["card_review", "card_stopped"]  # each once
+
+
+CARD_SETTLE = 0.5
+
+
+def test_a_tidy_that_changed_something_notifies_once(hermes):
+    """The curator fires no hook: the watcher reads each profile's new run reports, from now on, and
+    sends one quiet notice for the newest tidy that changed something."""
+    import sys
+    from hermes_constants import get_hermes_home
+    _, handler = hermes
+    key, token = make_device(handler, name="tidy-watch")
+    push = sys.modules[handler.__module__]._instance()
+    root = get_hermes_home() / "logs" / "curator"
+
+    def write(run: str, report: dict):
+        (root / run).mkdir(parents=True, exist_ok=True)
+        (root / run / "run.json").write_text(json.dumps(report))
+
+    write("20261001-030000", {"consolidated": [{"name": "old", "into": "new"}], "archived": ["old"]})
+    push.poll_tidies()  # first sight: the old report says nothing
+    assert push.store.read()["tidy_cursors"]["default"] == "20261001-030000"
+
+    def tidies():
+        return [n for n in (opened(key, p) for p in pushes_for(token, "alert")) if n.get("kind") == "tidied"]
+
+    assert not tidies()
+    write("20261016-030000", {"consolidated": [], "archived": [], "auto_transitions": {"marked_stale": 0}})
+    push.poll_tidies()
+    time.sleep(CARD_SETTLE)
+    assert not tidies()  # nothing changed, nothing sent
+    write("20261016-040000", {
+        "consolidated": [{"name": "xcode-test-runner", "into": "ios-testing"}, {"name": "snapshot-tests", "into": "ios-testing"}],
+        "pruned": [{"name": "docker-cleanup"}], "archived": ["xcode-test-runner", "snapshot-tests", "docker-cleanup"],
+        "auto_transitions": {"archived": 2, "marked_stale": 1}})
+    push.poll_tidies()
+    notice = wait_for(lambda: tidies() and tidies()[-1])
+    assert notice["title"] == "Hermes tidied its skills" and notice["category"] == "OPEN"
+    assert notice["body"] == "Merged 2 overlapping skills, archived 3 unused ones and marked 1 as stale."
+    assert (notice["merged"], notice["archived"], notice["stale"]) == (2, 3, 1) and "profile" not in notice
+    request = [p for p in pushes_for(token, "alert") if opened(key, p).get("kind") == "tidied"][-1]
+    assert request["payload"]["aps"]["interruption-level"] == "passive" and "sound" not in request["payload"]["aps"]
+    push.poll_tidies()
+    time.sleep(CARD_SETTLE)
+    assert len(tidies()) == 1  # once
