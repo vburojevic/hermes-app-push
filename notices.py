@@ -250,6 +250,10 @@ def apns_request(device: dict, notice: Notice, gateway: dict, open_count: int, r
     category, level, relevance, fallback = KINDS[notice.kind]
     if notice.category == MEMORY:
         category, level, fallback = MEMORY, "active", "Hermes wants to remember something"
+    if notice.kind == "approval" and notice.extra.get("smart_denied"):
+        # A command Hermes's safety check flagged is answered on its card in the app, never from a
+        # banner: even the fallback notification (before the app's extension runs) offers no Allow.
+        category = OPEN
     aps: dict[str, Any] = {
         "alert": {"title": fallback, "body": "Open Hermes to see it."},
         "mutable-content": 1, "category": category, "interruption-level": level, "relevance-score": relevance,

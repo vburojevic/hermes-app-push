@@ -422,8 +422,10 @@ class Push:
         self.store.open_request(request_id, {"kind": "approval", "session": chat_session, "key": session_key,
                                              "expires_at": expires_at})
         self.deliver(notice)
+        # A flagged command's Live Activity carries no request id, so it shows no Allow on the Lock Screen.
+        flagged = bool(notice.extra.get("smart_denied"))
         self._activity(chat_session, {**(self._activity_state.get(chat_session) or {}), "phase": "needsYou",
-                                      "command": notice.extra["command"], "request_id": request_id,
+                                      "command": notice.extra["command"], "request_id": None if flagged else request_id,
                                       "expires_at": expires_at, "title": chat, "answer": answer},
                        alert=True, force=True)
 
