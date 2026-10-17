@@ -420,6 +420,48 @@ def test_answer_routes_and_live_presence(hermes, monkeypatch):
     assert [opened(key, p)["session_id"] for p in pushes_for(token, "alert")] == ["chat-other"]
 
 
+def test_a_bots_own_turns_skip_the_reply_threshold(hermes):
+    """A routine's output and another Bot's message start turns in a Bot Chat that nobody waits on:
+    however quick, a routine's notifies (Scheduled tasks), a Bot-to-Bot exchange only when it
+    mentions the person (Bots: mentions, the default)."""
+    plugins, handler = hermes
+    key, token = make_device(handler, "bot-chats")  # default 30 s threshold
+    session = "20261017_bot_chat"
+
+    def turn(turn_id, user_message, answer):
+        plugins.invoke_hook("pre_llm_call", session_id=session, turn_id=turn_id, platform="tui",
+                            user_message=user_message)
+        plugins.invoke_hook("post_llm_call", session_id=session, turn_id=turn_id, assistant_response=answer)
+        plugins.invoke_hook("on_session_end", session_id=session, turn_id=turn_id, completed=True)
+
+    turn("routine-1", '[Cronjob "growth-summary" output — scheduled job, not the user. Review it, act on '
+         'anything that needs action, and summarize for the chat.]\n\nInstalls: 12', "📊 Pulse: two decisions wait for you.")
+    push = wait_for(lambda: next(iter(pushes_for(token, "alert")), None))
+    content = opened(key, push)
+    assert content["kind"] == "reply" and content["body"] == "📊 Pulse: two decisions wait for you."
+    assert push["payload"]["aps"]["category"] == "REPLY"
+
+    # Another Bot's message: Bots among themselves stay quiet unless the person is mentioned.
+    before = len(pushes_for(token, "alert"))
+    turn("dm-1", [{"type": "text", "text": "Message from 🤖 Cofounder (@cofounder): status?"}], "All green.")
+    time.sleep(0.5)
+    assert len(pushes_for(token, "alert")) == before
+    turn("dm-2", "Message from 🤖 Cofounder (@cofounder): status?", "All green, @everyone can ship.")
+    wait_for(lambda: len(pushes_for(token, "alert")) == before + 1)
+
+    # The person's own quick question still waits for the threshold (or for them to walk away).
+    turn("own-1", "What's the status?", "All green.")
+    time.sleep(0.5)
+    assert len(pushes_for(token, "alert")) == before + 1
+
+    # Scheduled tasks off: a routine's turn is quiet too.
+    key2, token2 = make_device(handler, "no-tasks", tasks="off")
+    turn("routine-2", '[Cronjob "growth-summary" output — scheduled job, not the user.]\n\nInstalls: 13', "Pulse.")
+    wait_for(lambda: len(pushes_for(token, "alert")) == before + 2)
+    time.sleep(0.3)
+    assert not pushes_for(token2, "alert")
+
+
 def test_reply_after_walking_away_and_kanban_jobs(hermes):
     plugins, handler = hermes
     key, token = make_device(handler, "walker")  # default 30 s threshold

@@ -217,10 +217,20 @@ class Push:
             return False
         if kind == "password" and not prefs["passwords"]:
             return False
+        origin = notice.extra.get("origin")
+        if kind == "reply" and origin == "routine":
+            # A Bot's take on its routine's output: nobody was waiting on it, so no threshold. A
+            # scheduled task's news, under the same switch.
+            if prefs["tasks"] != "all":
+                return False
+        elif kind == "reply" and origin == "bot":
+            # A Bot answering another Bot's message: Bots talking among themselves, like a group chat.
+            if prefs["bots"] == "off" or (prefs["bots"] == "mentions" and not notice.extra.get("mention")):
+                return False
         # A reply: when the turn ran past the threshold, or this device was watching the chat when the
         # turn started and has left since (asked, then put the phone away).
-        if kind == "reply" and (not prefs["replies"] or (notice.extra.get("seconds", 0) < prefs["reply_after"]
-                                                         and device_id not in (walked_away or set()))):
+        elif kind == "reply" and (not prefs["replies"] or (notice.extra.get("seconds", 0) < prefs["reply_after"]
+                                                           and device_id not in (walked_away or set()))):
             return False
         if kind == "task" and prefs["tasks"] != "all":
             return False
@@ -319,7 +329,7 @@ class Push:
     # -- hooks ---------------------------------------------------------------------------------------
 
     def on_pre_llm_call(self, session_id: str = "", turn_id: str = "", platform: str = "",
-                        parent_session_id: str = "", **_: Any) -> None:
+                        parent_session_id: str = "", user_message: Any = "", **_: Any) -> None:
         if not turn_id:
             return
         # A subagent's turn is part of its parent's; a messaging platform's chat notifies in that app.
@@ -328,7 +338,7 @@ class Push:
                     if entry.get("state") == "foreground" and entry.get("session") == session_id}
         with self._lock:
             self._turns[turn_id] = {"session": session_id, "start": time.time(), "text": "", "reports": reports,
-                                    "watching": watching, "profile": _profile()}
+                                    "watching": watching, "profile": _profile(), "origin": _origin(user_message)}
             self._active_sessions[session_id] = self._active_sessions.get(session_id, 0) + 1
         if reports:
             self._activity(session_id, {"phase": "working", "step": "Thinking", "started_at": time.time(),
@@ -363,6 +373,9 @@ class Push:
                                    text=turn["text"], seconds=seconds)
             if turn.get("profile"):
                 notice.extra["profile"] = turn["profile"]
+            if turn.get("origin") in ("routine", "bot"):
+                notice.extra["origin"] = turn["origin"]
+                notice.extra["mention"] = self._mentions(turn["text"])
             self.deliver(notice, walked_away=turn.get("watching"))
 
     def on_pre_tool_call(self, tool_name: str = "", args: Any = None, session_id: str = "", **_: Any) -> None:
@@ -494,13 +507,17 @@ class Push:
             return
         room_id, member_id, _turn = key
         room_name, bot = _room_names(room_id, member_id)
+        self.deliver(notices.message(room_id=room_id, room=room_name, member_id=member_id, bot=bot,
+                                     gateway_name=self.gateway_name(), text=buffer["text"],
+                                     mention=self._mentions(buffer["text"])))
+
+    def _mentions(self, text: str) -> bool:
+        """Whether ``text`` @mentions the person (any device's ``mention_names``) or everyone."""
         names = set()
         for device in self.store.devices().values():
             names.update(n.lower() for n in (device.get("preferences") or {}).get("mention_names", []) if n)
-        lowered = buffer["text"].lower()
-        mention = any(f"@{n}" in lowered for n in names | {"all", "everyone"})
-        self.deliver(notices.message(room_id=room_id, room=room_name, member_id=member_id, bot=bot,
-                                     gateway_name=self.gateway_name(), text=buffer["text"], mention=mention))
+        lowered = str(text or "").lower()
+        return any(f"@{n}" in lowered for n in names | {"all", "everyone"})
 
     # -- the Board (docs/board.md §5) -------------------------------------------------------------------
     # Hermes fires hooks for a blocked card and a finished one; "ready for review" and "stopped" have
@@ -701,6 +718,20 @@ def _gateway_approvals(session_key: str) -> list[dict]:
         from tools.approval import list_gateway_approvals
         return list_gateway_approvals(session_key) or []
     return []
+
+
+def _origin(user_message: Any) -> str:
+    """Who started a turn: a routine delivering its output into a Bot Chat (``bot-chat`` cron
+    delivery, cron/scheduler_delivery.py), another Bot's message (tools/bot_mode_dm.py), or the person."""
+    text = user_message
+    if isinstance(text, list):  # multimodal content: the first text part
+        text = next((part.get("text") for part in text if isinstance(part, dict) and part.get("text")), "")
+    text = str(text or "").lstrip()
+    if text.startswith('[Cronjob "'):
+        return "routine"
+    if text.startswith("Message from 🤖 "):
+        return "bot"
+    return "person"
 
 
 def _profile() -> str:
