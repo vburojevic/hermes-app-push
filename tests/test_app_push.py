@@ -201,7 +201,7 @@ def test_register_status_and_bad_input(hermes):
     status = json.loads(handler('status {"device_id": "dev-status"}'))
     assert status["registered"] and status["relay_registered"] and status["gateway"]["name"] == "Test Mac"
     manifest = re.search(r"^version: (\S+)$", (PLUGIN_DIR / "plugin.yaml").read_text(), re.M).group(1)
-    assert status["version"] == manifest == "1.4.6"  # VERSION in core.py and plugin.yaml move together
+    assert status["version"] == manifest == "1.4.7"  # VERSION in core.py and plugin.yaml move together
     assert status["preferences"]["tasks"] == "all" and status["preferences"]["bots"] == "mentions"
     bad = json.loads(handler('register {"device_id": "x", "token": "zz"}'))
     assert bad["ok"] is False and "malformed" in bad["error"]
@@ -1457,6 +1457,120 @@ def test_the_badge_follows_reads_and_new_replies(reading):
     assert fifth["payload"] == {"aps": {"badge": len(push.store.read()["requests"]) + 4}}
     presence(handler, "badge-phone", state="away")
     assert "dev-badge-phone" not in push.store.read()["badges"]
+
+
+def test_a_chat_hermes_never_marked_counts_once_read(reading):
+    """A listed chat Hermes never marked (``last_read_at`` empty) is read by Hermes' rule, and the app's list
+    doesn't count it: its reply notifies but counts on no badge, as on the Mac, until a read gives it
+    Hermes' mark. It once counted on a sleeping phone from the reply's notice (plugin 1.4.7)."""
+    plugins, handler, push, later = reading
+    key, token = make_device(handler, "unmarked-phone", reply_after=0)
+    chat = "20261026_unmarked_chat"
+    counted = len(push.store.read()["requests"])
+    presence(handler, "unmarked-phone", state="away", unread={"chats": [], "rooms": []},
+             listed={"chats": [chat], "rooms": []}, unmarked={"chats": [chat], "rooms": []}, badge=counted)
+    record = push.store.read()["badges"]["dev-unmarked-phone"]
+    assert record["unmarked_chats"] == [chat]
+    later.run()
+    pushed = len(badges_for(token))
+
+    finish_turn(plugins, chat, "unmarked-1")
+    wait_for(lambda: len(notices_for(key, token)) == 1)
+    assert push.store.read()["badges"]["dev-unmarked-phone"]["chats"] == []
+    assert later.delays(("badge", "dev-unmarked-phone")) == []
+    later.run()
+    assert len(badges_for(token)) == pushed
+
+    # Read on the Mac: Hermes marks it, so the next reply is unread everywhere.
+    read(handler, "unmarked-mac", chats=[chat])
+    assert push.store.read()["badges"]["dev-unmarked-phone"]["unmarked_chats"] == []
+    later.run()
+    finish_turn(plugins, chat, "unmarked-2")
+    wait_for(lambda: len(notices_for(key, token)) == 2)
+    assert push.store.read()["badges"]["dev-unmarked-phone"]["chats"] == [chat]
+    later.run()
+    badge = wait_for(lambda: badges_for(token)[pushed:] and badges_for(token)[-1])
+    assert badge["payload"] == {"aps": {"badge": counted + 1}}
+
+
+def test_a_chat_deleted_or_archived_elsewhere_comes_off_the_badge(reading):
+    """A chat deleted or archived on another device (or in Hermes Desktop, the CLI) leaves the list, so it
+    leaves a sleeping phone's badge too: Hermes' ``on_session_delete``, fired by its own session store, takes
+    it off every device's count, with a badge-only push and a read push so the app, woken, doesn't count it
+    again. It once said 1 with nothing unread in the list until the app ran (plugin 1.4.7)."""
+    plugins, handler, push, later = reading
+    from hermes_state import SessionDB
+    key, token = make_device(handler, "gone-phone", reply_after=0)
+    deleted, archived, kept, quiet = ("20261026_gone_deleted", "20261026_gone_archived", "20261026_gone_kept",
+                                      "20261026_gone_quiet")
+    db = SessionDB(db_path=HOME / "state.db")
+    for session in (deleted, archived, kept, quiet):
+        db.create_session(session, "api_server")
+    counted = len(push.store.read()["requests"]) + 1
+    presence(handler, "gone-phone", state="away", unread={"chats": [deleted], "rooms": []},
+             listed={"chats": [deleted, archived, kept, quiet], "rooms": []}, badge=counted)
+    later.run()
+    pushed = len(badges_for(token))
+
+    # Deleted on the Mac, where the phone counted it unread as it left: the badge reaches what's left.
+    assert db.delete_session(deleted)
+    assert push.store.read()["badges"]["dev-gone-phone"]["chats"] == []
+    assert deleted not in push.store.read()["badges"]["dev-gone-phone"]["listed_chats"]
+    assert later.delays(("badge", "dev-gone-phone")) == [3.0] and later.delays(("read", "dev-gone-phone")) == [3.0]
+    later.run()
+    badge = wait_for(lambda: badges_for(token)[pushed:] and badges_for(token)[-1])
+    assert badge["payload"] == {"aps": {"badge": counted - 1}}
+    woken = opened(key, wait_for(lambda: next(iter(reads_for(key, token)), None)))
+    assert list(read_times(woken)) == [deleted]
+
+    # A reply the phone was sent, then the chat archived on the Mac: off the count, its notification goes.
+    finish_turn(plugins, archived, "gone-1")
+    wait_for(lambda: len(notices_for(key, token)) == 1)
+    assert push.store.read()["badges"]["dev-gone-phone"]["chats"] == [archived]
+    later.run()
+    wait_for(lambda: badges_for(token)[-1]["payload"] == {"aps": {"badge": counted}})
+    pushed = len(badges_for(token))
+    assert db.set_session_archived(archived, True)
+    record = push.store.read()["badges"]["dev-gone-phone"]
+    assert record["chats"] == [] and archived not in record["listed_chats"]
+    assert archived not in push.store.read()["delivered"]["dev-gone-phone"]["chats"]
+    later.run()
+    badge = wait_for(lambda: badges_for(token)[pushed:] and badges_for(token)[-1])
+    assert badge["payload"] == {"aps": {"badge": counted - 1}}
+    # Every notice lists it with the reads, so the extension takes it off its list too.
+    finish_turn(plugins, kept, "gone-2")
+    notice = wait_for(lambda: len(notices_for(key, token)) == 2 and notices_for(key, token)[-1])
+    assert {deleted, archived} <= set(read_times(notice))
+
+    # A chat no device counted or was sent anything for only leaves the lists: no read, no push.
+    later.run()
+    waiting = list(later.waiting)  # the archive's read push, waiting out the 30 s since the last one
+    assert db.delete_session(quiet)
+    assert quiet not in push.store.read()["badges"]["dev-gone-phone"]["listed_chats"]
+    assert quiet not in push.store.read()["reads"]["chats"]
+    assert later.waiting == waiting
+
+
+def test_a_session_moved_to_another_profile_keeps_counting(reading):
+    """Hermes fires ``on_session_delete`` for a session moved to the profile that owns it
+    (``profile_repair``): the chat lives on there, so it stays on the badge. A reason Hermes adds later is
+    left alone too, and a broken payload never raises."""
+    plugins, handler, push, later = reading
+    make_device(handler, "moved-phone", reply_after=0)
+    chat = "20261026_moved"
+    presence(handler, "moved-phone", state="away", unread={"chats": [chat], "rooms": []},
+             listed={"chats": [chat], "rooms": []}, badge=len(push.store.read()["requests"]) + 1)
+    later.run()
+    for reason in ("profile_repair", "something_new"):
+        plugins.invoke_hook("on_session_delete", session_id=chat, reason=reason, profile=None)
+    plugins.invoke_hook("on_session_delete", session_id=None, reason="delete", deleted_ids="not-a-list")
+    record = push.store.read()["badges"]["dev-moved-phone"]
+    assert record["chats"] == [chat] and record["listed_chats"] == [chat]
+    assert later.delays(("badge", "dev-moved-phone")) == []
+    # Several at once (a bulk delete): each named in ``deleted_ids`` goes.
+    plugins.invoke_hook("on_session_delete", session_id="20261026_other", reason="delete", profile=None,
+                        deleted_ids=["20261026_other", chat])
+    assert push.store.read()["badges"]["dev-moved-phone"]["chats"] == []
 
 
 def test_news_read_before_its_notice_goes_nowhere(reading, monkeypatch):

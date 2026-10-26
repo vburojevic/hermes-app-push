@@ -22,7 +22,7 @@ from .relay import DEAD_TOKEN_REASONS, Delivery, Relay
 from .store import Store, recent_reads
 
 logger = logging.getLogger("hermes_app_push")
-VERSION = "1.4.6"
+VERSION = "1.4.7"
 
 DEFAULT_PREFERENCES = {
     "approvals": True,          # approvals and questions
@@ -50,6 +50,9 @@ PUSH_DEBOUNCE = 3.0            # a read or badge push waits this long, so a burs
 MAX_PRESENCE_IDS = 200         # chats (and rooms) a device may name as unread or muted when it leaves
 MAX_LISTED_IDS = 600           # chats (and rooms) its list shows, when it leaves
 MAX_READ_IDS = 50              # chats (and rooms) one ``read`` may name
+# ``on_session_delete`` reasons whose chats are gone from the person's list (Hermes' ``emit_session_deleted``
+# callers); ``profile_repair`` moves a session to the profile that owns it, where it lives on.
+GONE_REASONS = {"delete", "archive", "prune", "ghost_prune", "empty_sweep"}
 # Surfaces whose replies the app reports. A messaging platform's own app already notifies, and cron
 # results come through the delivery platform.
 NOTIFY_PLATFORMS = {"", "api_server", "api", "tui", "desktop", "dashboard", "webui", "cli", "local", "acp"}
@@ -176,7 +179,8 @@ class Push:
             shown = args.get("badge")
             shown = min(int(shown), 9999) if isinstance(shown, (int, float)) and not isinstance(shown, bool) and shown >= 0 else None
             self.store.set_badge(device_id, unread, _id_sets(args.get("muted")) if unread is not None else None, others,
-                                 _id_sets(args.get("listed"), MAX_LISTED_IDS), shown)
+                                 _id_sets(args.get("listed"), MAX_LISTED_IDS), shown,
+                                 _id_sets(args.get("unmarked"), MAX_LISTED_IDS))
             if unread is not None:
                 # An icon left showing a count this gateway doesn't have (a request answered elsewhere while
                 # the app slept, its background push dropped) is set right.
@@ -544,6 +548,22 @@ class Push:
                 notice.extra["origin"] = turn["origin"]
                 notice.extra["mention"] = self._mentions(turn["text"])
             self.deliver(notice, walked_away=turn.get("watching"), news_at=turn.get("answered_at") or turn["start"])
+
+    def on_session_delete(self, session_id: str = "", reason: str = "", deleted_ids: Any = None, **_: Any) -> None:
+        """Chats deleted or archived anywhere (the app, Hermes Desktop, the CLI, a prune) leave every device's
+        badge: a device away from the app that counts one gets a badge-only push, and a read push so its app,
+        woken, doesn't count it again (plugin 1.4.7). A session moved to another profile keeps its chat."""
+        if reason not in GONE_REASONS:
+            return
+        ids = deleted_ids if isinstance(deleted_ids, list) else []
+        chats = [key for key in dict.fromkeys([session_id, *ids]) if isinstance(key, str) and key]
+        result = self.store.record_gone(chats) if chats else None
+        if result is None:
+            return
+        for owed, wait in result["read"]:
+            self._soon("read", owed, max(PUSH_DEBOUNCE, wait))
+        for moved in result["badge"]:
+            self._soon("badge", moved, PUSH_DEBOUNCE)
 
     # -- keeping chats current on devices that left the app ---------------------------------------------
 
@@ -943,7 +963,8 @@ def _ids(value: Any, key: str, limit: int) -> list[str]:
 
 
 def _id_sets(value: Any, limit: int = 0) -> dict | None:
-    """``{chats, rooms}`` as ``presence`` takes it (``unread``, ``muted``, ``listed``); None when it isn't one."""
+    """``{chats, rooms}`` as ``presence`` takes it (``unread``, ``muted``, ``listed``, ``unmarked``); None when it
+    isn't one."""
     if not isinstance(value, dict):
         return None
     sets = {}

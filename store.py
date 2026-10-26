@@ -297,11 +297,12 @@ class Store:
         self.update(change)
 
     def set_badge(self, device_id: str, unread: dict | None, muted: dict | None, others: int = 0,
-                  listed: dict | None = None, shown: int | None = None) -> None:
+                  listed: dict | None = None, shown: int | None = None, unmarked: dict | None = None) -> None:
         """Leaving the app, a device that counts unread chats in its badge names them (``unread``), the muted
-        ones, every chat its list shows (``listed``: only those may count), what the person's other gateways
-        add to its badge (``others``) and the badge it shows (``shown``; older apps don't say, so their
-        badge is set once). None: it doesn't count them."""
+        ones, every chat its list shows (``listed``: only those may count), the listed chats Hermes never
+        marked (``unmarked``: Hermes reads them as read, so they count only once a read marks them), what the
+        person's other gateways add to its badge (``others``) and the badge it shows (``shown``; older apps
+        don't say, so their badge is set once). None: it doesn't count them."""
         def change(state: dict) -> None:
             if unread is None:
                 state["badges"].pop(device_id, None)
@@ -311,7 +312,8 @@ class Store:
                       "muted_chats": list((muted or {}).get("chats") or []),
                       "muted_rooms": list((muted or {}).get("rooms") or []), "others": max(0, int(others)),
                       "listed_chats": list((listed or {}).get("chats") or []),
-                      "listed_rooms": list((listed or {}).get("rooms") or []), "at": time.time()}
+                      "listed_rooms": list((listed or {}).get("rooms") or []),
+                      "unmarked_chats": list((unmarked or {}).get("chats") or []), "at": time.time()}
             # What the icon shows: the next badge push goes when this count differs from it.
             record["shown"] = shown
             state["badges"][device_id] = record
@@ -346,6 +348,9 @@ class Store:
                 # session is news the person can't open, and counted for ever (a badge of 120 for 2 unread).
                 if key not in record.get(f"listed_{kind}", []):
                     continue
+                # A chat Hermes never marked is read by Hermes' rule, and the app's list doesn't count it.
+                if key in record.get(f"unmarked_{kind}", []):
+                    continue
                 record[kind] = (record.get(kind, []) + [key])[-UNREAD_MAX:]
                 moved.append(device_id)
             return moved
@@ -356,53 +361,26 @@ class Store:
         device away from the app what it was sent for them is cleared and its unread count drops. Returns
         ``{"open", "read": [(device, seconds until a read push may go)], "badge": [devices whose count
         moved]}``."""
-        def change(state: dict) -> dict:
-            now = time.time()
-            reads = _reads(state)
-            read = {"chats": chats, "rooms": rooms}
-            for kind in KINDS:
-                for key in read[kind]:
-                    reads[kind][key] = now
-                _keep_newest(reads[kind], READ_MEMORY, now - READ_TTL)
-            owed, moved = [], []
-            for device_id in state["devices"]:
-                if device_id == reader or _in_app(state, device_id, now):
-                    continue
-                sent = state["delivered"].get(device_id) or {}
-                matched = False
-                for kind in KINDS:
-                    hits = [key for key in read[kind] if (sent.get(kind) or {}).get(key, now + 1) <= now]
-                    if not hits:
-                        continue
-                    matched = True
-                    cleared = state["cleared"].setdefault(device_id, {}).setdefault(kind, {})
-                    for key in hits:
-                        sent[kind].pop(key, None)
-                        cleared[key] = now  # when it was read: the newest read of it counts
-                    _keep_newest(cleared, CLEARED_MAX)
-                # Off its count too: the app marks a room read here when it hears another device read it
-                # (group chats have no read mark on the gateway, docs/inbox.md §1).
-                record = state["badges"].get(device_id)
-                if record:
-                    before = {kind: list(record.get(kind) or []) for kind in KINDS}
-                    for kind in KINDS:
-                        record[kind] = [key for key in before[kind] if key not in set(read[kind])]
-                        # A chat it counted unread as it left, never sent to it: its read goes in the read
-                        # push too, or the app, woken, would put it back on the icon the badge push set.
-                        counted = [key for key in before[kind] if key in set(read[kind])]
-                        if counted:
-                            matched = True
-                            cleared = state["cleared"].setdefault(device_id, {}).setdefault(kind, {})
-                            for key in counted:
-                                cleared[key] = now
-                            _keep_newest(cleared, CLEARED_MAX)
-                    if any(record[kind] != before[kind] for kind in KINDS):
-                        moved.append(device_id)
-                if matched:
-                    entry = state["read_pushes"].setdefault(device_id, {})
-                    entry["pending"] = True
-                    owed.append((device_id, entry.get("sent", 0) + READ_MIN_INTERVAL - now))
-            return {"open": len(state["requests"]), "read": owed, "badge": moved}
+        return self.update(lambda state: _record_read(state, reader, chats, rooms))
+
+    def record_gone(self, chats: list[str]) -> dict | None:
+        """Chats deleted or archived (Hermes' ``on_session_delete``): no device's list shows them now. Those a
+        device away from the app counts or was sent news for are read everywhere (``record_read``), so the
+        read and badge pushes and every notice's reads take them off the devices too; the others only leave
+        the lists. Returns ``record_read``'s answer, or None when no device knew them."""
+        def change(state: dict) -> dict | None:
+            gone = set(chats)
+            known = set()
+            for record in state["badges"].values():
+                known.update(key for key in record.get("chats") or [] if key in gone)
+                for kind in ("listed_chats", "unmarked_chats"):
+                    if any(key in gone for key in record.get(kind) or []):
+                        record[kind] = [key for key in record[kind] if key not in gone]
+            for sent in state["delivered"].values():
+                known.update(key for key in (sent.get("chats") or {}) if key in gone)
+            if not known:
+                return None
+            return _record_read(state, "", sorted(known), [])
         return self.update(change)
 
     def claim_read_push(self, device_id: str) -> tuple[dict | None, float]:
@@ -455,6 +433,60 @@ def recent_reads(state: dict, limit: int = NOTICE_READS) -> dict:
     listed = {kind: [[key, round(at, 3)] for key, at in _newest_items(reads[kind], limit) if at >= since]
               for kind in KINDS}
     return listed if listed["chats"] or listed["rooms"] else {}
+
+
+def _record_read(state: dict, reader: str, chats: list[str], rooms: list[str]) -> dict:
+    """``Store.record_read`` inside an update; ``reader`` "" is no device (a chat deleted everywhere)."""
+    now = time.time()
+    reads = _reads(state)
+    read = {"chats": chats, "rooms": rooms}
+    for kind in KINDS:
+        for key in read[kind]:
+            reads[kind][key] = now
+        _keep_newest(reads[kind], READ_MEMORY, now - READ_TTL)
+    # Read on an app device, a chat has Hermes' mark now: its next reply counts everywhere.
+    for record in state["badges"].values():
+        if record.get("unmarked_chats"):
+            record["unmarked_chats"] = [key for key in record["unmarked_chats"] if key not in set(chats)]
+    owed, moved = [], []
+    for device_id in state["devices"]:
+        if device_id == reader or _in_app(state, device_id, now):
+            continue
+        sent = state["delivered"].get(device_id) or {}
+        matched = False
+        for kind in KINDS:
+            hits = [key for key in read[kind] if (sent.get(kind) or {}).get(key, now + 1) <= now]
+            if not hits:
+                continue
+            matched = True
+            cleared = state["cleared"].setdefault(device_id, {}).setdefault(kind, {})
+            for key in hits:
+                sent[kind].pop(key, None)
+                cleared[key] = now  # when it was read: the newest read of it counts
+            _keep_newest(cleared, CLEARED_MAX)
+        # Off its count too: the app marks a room read here when it hears another device read it
+        # (group chats have no read mark on the gateway, docs/inbox.md §1).
+        record = state["badges"].get(device_id)
+        if record:
+            before = {kind: list(record.get(kind) or []) for kind in KINDS}
+            for kind in KINDS:
+                record[kind] = [key for key in before[kind] if key not in set(read[kind])]
+                # A chat it counted unread as it left, never sent to it: its read goes in the read
+                # push too, or the app, woken, would put it back on the icon the badge push set.
+                counted = [key for key in before[kind] if key in set(read[kind])]
+                if counted:
+                    matched = True
+                    cleared = state["cleared"].setdefault(device_id, {}).setdefault(kind, {})
+                    for key in counted:
+                        cleared[key] = now
+                    _keep_newest(cleared, CLEARED_MAX)
+            if any(record[kind] != before[kind] for kind in KINDS):
+                moved.append(device_id)
+        if matched:
+            entry = state["read_pushes"].setdefault(device_id, {})
+            entry["pending"] = True
+            owed.append((device_id, entry.get("sent", 0) + READ_MIN_INTERVAL - now))
+    return {"open": len(state["requests"]), "read": owed, "badge": moved}
 
 
 def _forget(state: dict, device_id: str) -> bool:

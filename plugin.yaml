@@ -1,6 +1,6 @@
 name: hermes-app-push
 label: Hermes app push
-version: 1.4.6
+version: 1.4.7
 manifest_version: 2
 kind: standalone
 description: >
@@ -21,6 +21,7 @@ provides_hooks:
   - on_room_member_activity
   - kanban_task_completed
   - kanban_task_blocked
+  - on_session_delete
 config_schema:
   relay_url:
     type: string
