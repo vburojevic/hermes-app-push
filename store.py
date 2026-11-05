@@ -10,7 +10,11 @@ file and is never logged or returned to a client.
 from __future__ import annotations
 
 import contextlib
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; use msvcrt byte-range locking
+    fcntl = None
+    import msvcrt
 import json
 import logging
 import os
@@ -108,7 +112,14 @@ class Store:
             pause = 0.002
             while True:
                 try:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if fcntl is not None:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:
+                        handle.seek(0)
+                        try:
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        except OSError:
+                            raise BlockingIOError from None
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
@@ -120,13 +131,26 @@ class Store:
             try:
                 yield
             finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+                else:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
     def _read(self, prune: bool = True) -> dict:
-        try:
-            data = json.loads(self.path.read_text())
-        except (FileNotFoundError, ValueError):
-            return _empty()
+        deadline = time.monotonic() + self.lock_timeout
+        pause = 0.001
+        while True:
+            try:
+                data = json.loads(self.path.read_text())
+                break
+            except (FileNotFoundError, ValueError):
+                return _empty()
+            except PermissionError:
+                if os.name != "nt" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(pause)
+                pause = min(pause * 2, 0.02)
         base = _empty()
         base.update(data if isinstance(data, dict) else {})
         if prune:
@@ -140,7 +164,17 @@ class Store:
             with os.fdopen(fd, "w") as handle:
                 handle.write(text)
             os.chmod(tmp, 0o600)
-            os.replace(tmp, self.path)
+            deadline = time.monotonic() + self.lock_timeout
+            pause = 0.001
+            while True:
+                try:
+                    os.replace(tmp, self.path)
+                    break
+                except PermissionError:
+                    if os.name != "nt" or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(pause)
+                    pause = min(pause * 2, 0.02)
         except BaseException:
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
@@ -570,9 +604,19 @@ def _answerable(request: Any, now: float) -> bool:
 
 
 def _alive(pid: int) -> bool:
-    """Whether a process runs under ``pid``: signal 0 only checks, it delivers nothing."""
+    """Whether a process runs under ``pid``: signal 0 only checks on POSIX (on Windows 0 is CTRL_C_EVENT)."""
     if pid <= 0:
         return False
+    if os.name == "nt":
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED: another user's process
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == 0x00000102  # WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

@@ -871,21 +871,35 @@ def test_one_board_watcher_for_every_profile_copy(copies, tmp_path):
 
 
 def test_reads_never_take_the_write_lock(copies, tmp_path, monkeypatch):
-    import fcntl
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+        import msvcrt
     core = copies("app_push_reads")
     store_module = sys.modules["app_push_reads.store"]
     store = core.Store(tmp_path, lock_timeout=0.3)
     store.put_device("dev-reader", {"token": "ab" * 16, "preferences": {}})
     store.open_request("req-1", {"kind": "approval", "session": "s"})
     calls = []
-    real_flock = fcntl.flock
-    recording = types.SimpleNamespace(LOCK_EX=fcntl.LOCK_EX, LOCK_SH=fcntl.LOCK_SH, LOCK_NB=fcntl.LOCK_NB,
-                                      LOCK_UN=fcntl.LOCK_UN,
-                                      flock=lambda fd, op: (calls.append(op), real_flock(fd, op))[1])
-    monkeypatch.setattr(store_module, "fcntl", recording)
+    if fcntl is not None:
+        real_flock = fcntl.flock
+        recording = types.SimpleNamespace(LOCK_EX=fcntl.LOCK_EX, LOCK_SH=fcntl.LOCK_SH, LOCK_NB=fcntl.LOCK_NB,
+                                          LOCK_UN=fcntl.LOCK_UN,
+                                          flock=lambda fd, op: (calls.append(op), real_flock(fd, op))[1])
+        monkeypatch.setattr(store_module, "fcntl", recording)
+    else:
+        real_locking = msvcrt.locking
+        recording = types.SimpleNamespace(LK_NBLCK=msvcrt.LK_NBLCK, LK_UNLCK=msvcrt.LK_UNLCK,
+                                          locking=lambda fd, mode, n: (calls.append(mode), real_locking(fd, mode, n))[1])
+        monkeypatch.setattr(store_module, "msvcrt", recording)
     # Another process (or a stuck thread) holds the write lock.
     with open(store.lock_path, "a+") as holder:
-        real_flock(holder, fcntl.LOCK_EX)
+        if fcntl is not None:
+            real_flock(holder, fcntl.LOCK_EX)
+        else:
+            holder.seek(0)
+            real_locking(holder.fileno(), msvcrt.LK_NBLCK, 1)
         started = time.monotonic()
         assert "dev-reader" in store.devices() and "req-1" in store.open_requests()
         assert store.read()["devices"] and store.presence("dev-reader") is None
@@ -896,8 +910,13 @@ def test_reads_never_take_the_write_lock(copies, tmp_path, monkeypatch):
         with pytest.raises(store_module.StoreBusy):
             store.put_device("dev-blocked", {"token": "cd" * 16})
         assert 0.25 <= time.monotonic() - started < 2
-        assert calls and all(op & fcntl.LOCK_NB for op in calls if op != fcntl.LOCK_UN)
-        real_flock(holder, fcntl.LOCK_UN)
+        if fcntl is not None:
+            assert calls and all(op & fcntl.LOCK_NB for op in calls if op != fcntl.LOCK_UN)
+            real_flock(holder, fcntl.LOCK_UN)
+        else:
+            assert calls and all(op == msvcrt.LK_NBLCK for op in calls if op != msvcrt.LK_UNLCK)
+            holder.seek(0)
+            real_locking(holder.fileno(), msvcrt.LK_UNLCK, 1)
     store.put_device("dev-after", {"token": "ef" * 16})
     assert set(store.devices()) == {"dev-reader", "dev-after"}
     # Readers racing a busy writer only ever see a whole file.
@@ -934,6 +953,53 @@ def test_an_unchanged_state_is_never_rewritten(copies, tmp_path, monkeypatch):
     store.update(lambda s: s["card_cursors"].__setitem__("default", 8))
     assert len(writes) == 1 and store.read()["card_cursors"]["default"] == 8
     assert store.path.stat().st_ino != first.st_ino  # an atomic replace
+
+
+def test_windows_permission_error_retry_and_exhaustion_cleanup(copies, tmp_path, monkeypatch):
+    core = copies("app_push_win_replace")
+    store_module = sys.modules["app_push_win_replace.store"]
+    store = core.Store(tmp_path, lock_timeout=0.05)
+    store.update(lambda s: s.__setitem__("card_cursors", {"default": 1}))
+
+    real_replace = os.replace
+    attempts = {"n": 0}
+
+    def flaky_replace(src, dst):
+        attempts["n"] += 1
+        if attempts["n"] <= 2:
+            raise PermissionError(13, "WinError 5: Access is denied", str(src), 5, str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(store_module.os, "name", "nt", raising=False)
+    monkeypatch.setattr(store_module.os, "replace", flaky_replace)
+    store.update(lambda s: s.__setitem__("card_cursors", {"default": 2}))
+    assert attempts["n"] == 3
+    assert store.read()["card_cursors"] == {"default": 2}
+
+    # Persistent PermissionError past lock_timeout raises, preserves state, and cleans up .state-* tmp file.
+    def always_denied(src, dst):
+        raise PermissionError(13, "WinError 5: Access is denied", str(src), 5, str(dst))
+
+    monkeypatch.setattr(store_module.os, "replace", always_denied)
+    with pytest.raises(PermissionError):
+        store.update(lambda s: s.__setitem__("card_cursors", {"default": 99}))
+    assert store.read()["card_cursors"] == {"default": 2}
+    assert list(tmp_path.glob(".state-*")) == []
+
+    # On non-Windows hosts, PermissionError propagates immediately on the first attempt.
+    posix_attempts = {"n": 0}
+
+    def posix_denied(src, dst):
+        posix_attempts["n"] += 1
+        raise PermissionError(13, "Permission denied", str(src), None, str(dst))
+
+    monkeypatch.setattr(store_module.os, "name", "posix", raising=False)
+    monkeypatch.setattr(store_module.os, "replace", posix_denied)
+    with pytest.raises(PermissionError):
+        store.update(lambda s: s.__setitem__("card_cursors", {"default": 100}))
+    assert posix_attempts["n"] == 1
+    assert store.read()["card_cursors"] == {"default": 2}
+    assert list(tmp_path.glob(".state-*")) == []
 
 
 def test_quiet_boards_and_tidies_cost_no_lock_and_no_write(hermes, monkeypatch):
